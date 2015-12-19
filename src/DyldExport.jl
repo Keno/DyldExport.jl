@@ -6,7 +6,8 @@ using StrPack
 # Constants we'll need
 import MachO: N_EXT, N_ABS, NO_SECT,
     MH_MAGIC_64, CPU_TYPE_X86_64, MH_DYLIB, MH_NOUNDEFS,
-    LC_SYMTAB, LC_DYSYMTAB, LC_SEGMENT_64, MH_BUNDLE
+    LC_SYMTAB, LC_DYSYMTAB, LC_SEGMENT_64, MH_BUNDLE,
+    MH_PREBOUND, MH_EXECUTE, MH_DYLIB_STUB
 
 # And datastructures we'll need
 import MachO: mach_header_64, nlist_64, symtab_command, dysymtab_command,
@@ -19,10 +20,12 @@ end
 function create_sections(symbols::Dict{Symbol,Ptr{Void}})
     symtab = IOBuffer()
     strtab = IOBuffer()
+    symbols = [("_$k",v) for (k,v) in symbols]
+    sort!(symbols,by=x->x[1])
     for (name,value) in symbols
         sym = nlist_64(
             position(strtab), # n_strx
-            N_ABS,    # n_type
+            N_EXT | N_ABS,    # n_type
             NO_SECT,          # n_sect
             0,                # n_desc
             value)            # n_value
@@ -33,7 +36,20 @@ function create_sections(symbols::Dict{Symbol,Ptr{Void}})
     symtab, strtab
 end
 
-function create_image(symbols::Dict{Symbol,Ptr{Void}})
+function compute_size(symbols)
+    headersize = sizeof(mach_header_64)
+    lcssize = 8*sizeof(UInt32)+sizeof(symtab_command)+sizeof(dysymtab_command)+
+        2*sizeof(segment_command_64)
+    symsize = 0
+    for (k,v) in symbols
+        symsize += sizeof(nlist_64)
+        symsize += sizeof(string(k))+1
+    end
+    max(headersize+lcssize+symsize,4096)
+end
+
+function create_image(symbols::Dict{Symbol,Ptr{Void}},vmbase)
+    totalsize = compute_size(symbols)
     buf = IOBuffer()
     symtab, strtab = create_sections(symbols)
 
@@ -45,11 +61,11 @@ function create_image(symbols::Dict{Symbol,Ptr{Void}})
         MH_MAGIC_64,     # magic
         CPU_TYPE_X86_64, # cputype
         0,               # cpusubtype
-        MH_BUNDLE,       # filetype
+        MH_DYLIB,        # filetype
         4,               # ncmds
         # sizeofcmds
         lcssize,
-        MH_NOUNDEFS,    # flags
+        MH_NOUNDEFS|MH_PREBOUND,    # flags
     ))
 
     lcpos = position(buf)
@@ -60,14 +76,15 @@ function create_image(symbols::Dict{Symbol,Ptr{Void}})
     write(buf, UInt32(sizeof(segment_command_64)+2*sizeof(UInt32)))
     pack(buf, segment_command_64(
         MachO.small_fixed_string(reinterpret(UInt128,UInt8['_','_','T','E','X','T',0,0,0,0,0,0,0,0,0,0])[]),
-        0,4096,0,lcpos+lcssize,0x2,0x2,0,0
+        vmbase,4096,0,4096,0x2,0x2,0,0
     ))
 
+    # Needed, and also needs be be non-zero for dyld not to crash ugh!
     write(buf, UInt32(LC_SEGMENT_64))
     write(buf, UInt32(sizeof(segment_command_64)+2*sizeof(UInt32)))
     pack(buf, segment_command_64(
         MachO.small_fixed_string(reinterpret(UInt128,UInt8['_','_','L','I','N','K','E','D','I','T',0,0,0,0,0,0])[]),
-        4096,8192,0,4096,0x1,0x1,0,0
+        vmbase+4096,totalsize,0,totalsize,0x1,0x1,0,0
     ))
 
 
@@ -118,9 +135,36 @@ function create_image(symbols::Dict{Symbol,Ptr{Void}})
     seekend(buf)
 
     # Pad the file
-    write(buf, zeros(4096-position(buf)))
+    if (position(buf) < 4096)
+        write(buf, zeros(UInt8,4096-position(buf)))
+    end
 
     buf
+end
+
+function export_symbols(symbols)
+    # Reserve some memory right up until we're ready to dlopen
+    x = Ref{Ptr{Void}}()
+    x[] = 0
+    task = unsafe_load(cglobal(:mach_task_self_,Ptr{Void}))
+    @assert task != 0
+    size = DyldExport.compute_size(symbols) + 4096
+    ret = ccall(:vm_allocate,Cint,(Ptr{Void},Ref{Ptr{Void}},Csize_t,Bool),task,x,size,true)
+    @assert ret == 0
+
+    buf = DyldExport.create_image(symbols, x[])
+    data = takebuf_array(buf)
+    name = tempname()
+    open(name,"w") do f
+        write(f,data)
+    end
+    @show x[]
+    @assert ccall(:vm_deallocate,Cint,(Ptr{Void},Ptr{Void},Csize_t),
+        task,x[],size) == 0
+    @show name
+    handle = Libdl.dlopen(name,Libdl.RTLD_GLOBAL)
+    #rm(name)
+    name,handle
 end
 
 const NSObjectFileImageFailure = 0
@@ -138,6 +182,11 @@ function NSCreateObjectFileImageFromMemory(data)
         error("Failed to open object file")
     end
     out[]
+end
+
+# Hack for now
+if isdefined(Main,:Cxx)
+    include("cxxsupport.jl")
 end
 
 end # module
